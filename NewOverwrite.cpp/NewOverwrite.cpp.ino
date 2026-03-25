@@ -64,8 +64,32 @@ void SensorPing(const byte* frame, int len) {
   digitalWrite(RE, LOW);
   delay(80);
   while (mod.available()) mod.read();
-}
 
+}
+bool realRead(const byte* frame, float& result, float divisor) {
+    while (mod.available()) mod.read();
+GPIO_output_DE_RE_HIGH:
+    digitalWrite(DE, HIGH);
+    digitalWrite(RE, HIGH);
+    delay(10);
+    mod.write(frame, 8);
+    digitalWrite(DE, LOW);
+    digitalWrite(RE, LOW);
+
+    byte response[7];
+    for (int i = 0; i < 7; i++) {
+        unsigned long start = millis();
+        while (!mod.available()) {
+            if (millis() - start > 600) return false;
+        }
+        response[i] = mod.read();
+    }
+    if (response[0] == 0x01 && response[1] == 0x03) {
+        result = ((response[3] << 8) | response[4]) / divisor;
+        return true;
+    }
+    return false;
+}
 // ─── No Soil State ──────────────────────────────────────
 
 void printNoSensor() {
@@ -169,11 +193,18 @@ void startSequence(float phMin, float phMax,
   Serial.println("  ================================");
   Serial.println("   Sending Modbus read requests...");
   delay(300);
-  SensorPing(reqMoisture,   sizeof(reqMoisture));
-  SensorPing(reqPH,         sizeof(reqPH));
-  SensorPing(reqNitrogen,   sizeof(reqNitrogen));
-  SensorPing(reqPhosphorus, sizeof(reqPhosphorus));
-  SensorPing(reqPotassium,  sizeof(reqPotassium));
+  float rMoist, rPH, rN, rP, rK;
+  realRead(reqMoisture, rMoist, 10.0); delay(200);
+  realRead(reqPH, rPH, 10.0); delay(200);
+  realRead(reqNitrogen, rN, 1.0); delay(200);
+  realRead(reqPhosphorus, rP, 1.0); delay(200);
+  realRead(reqPotassium, rK, 1.0); delay(200);
+  phBase = (rPH && phMin <= rPH && rPH <= phMax) ? rPH : phBase;
+  moistBase = (rMoist && mMin <= rMoist && rMoist <= mMax) ? rMoist : moistBase;
+  nBase = (rN && nMin <= rN && rN <= nMax) ? rN : nBase;
+  pBase = (rP && pMin <= rP && rP <= pMax) ? rP : pBase;
+  kBase = (rK && kMin <= rK && rK <= kMax) ? rK : kBase;
+
   Serial.println("   All registers responded.      ");
   delay(400);
   Serial.println("   Stabilising sensor signal...  ");
@@ -202,26 +233,25 @@ void loop() {
   if (Serial.available()) {
     String input = Serial.readStringUntil('\n');
     input.trim();
-
-    if (input == "a" || input == "A") {
+    float hoax;
+    if (!realRead(reqPH, hoax, 10.0); delay(200)):
+      running         = false;
+      sensorConnected = false;
+      printNoSensor();
+    else if(hoax < 6.9){
       sensorConnected = true;
       isAcidic = true;
       // Acidic: pH 3–7, Moisture 20–45%, N 0.5–2.0%, P 0.3–1.5%, K 0.4–1.8%
       startSequence(3.0, 6.9, 20.0, 45.0,
                     0.50, 2.00, 0.30, 1.50, 0.40, 1.80);
-
-    } else if (input == "b" || input == "B") {
+    }else{
       sensorConnected = true;
       isAcidic = false;
       // Basic: pH 7–10, Moisture 45–75%, N 1.0–3.5%, P 0.8–2.5%, K 1.0–3.0%
       startSequence(7.1, 10.0, 45.0, 75.0,
                     1.00, 3.50, 0.80, 2.50, 1.00, 3.00);
-
-    } else if (input == "n" || input == "N") {
-      running         = false;
-      sensorConnected = false;
-      printNoSensor();
     }
+    
   }
 
   if (running && sensorConnected) {
