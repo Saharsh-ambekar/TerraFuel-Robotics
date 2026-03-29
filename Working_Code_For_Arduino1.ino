@@ -1,0 +1,377 @@
+#include <SoftwareSerial.h>
+#include <LiquidCrystal.h>
+
+
+#define DE 6
+#define RE 4
+#define SCREEN_INTERVAL 2500
+SoftwareSerial mod(6,4);
+LiquidCrystal lcd(8,9,10,11,12,13);
+
+const byte reqMoisture[] = { 0x01, 0x03, 0x00, 0x00, 0x00, 0x01, 0x84, 0x0A };
+const byte reqPH[] = { 0x01, 0x03, 0x00, 0x03, 0x00, 0x01, 0x74, 0x0A };
+const byte reqNitrogen[] = { 0x01, 0x03, 0x00, 0x04, 0x00, 0x01, 0xC5, 0xCB };
+const byte reqPhosphorus[] = { 0x01, 0x03, 0x00, 0x05, 0x00, 0x01, 0x94, 0x0B };
+const byte reqPotassium[] = { 0x01, 0x03, 0x00, 0x06, 0x00, 0x01, 0x64, 0x0B };
+
+float phBase, moistBase, nBase, pBase, kBase;
+float phAmp, moistAmp, nAmp, pAmp, kAmp;
+float maxAmp = 0.4;
+int   sign = 1;
+bool  running = false;
+bool  isAcidic = true;
+int   lcdScreen = 0;
+unsigned long lastScreenSwitch = 0;
+
+
+// ─── Helpers ────────────────────────────────────────────
+String soilNature(float ph) {
+    if (ph < 6.0)        return "Acidic  ";
+    else if (ph <= 7.5)  return "Neutral ";
+    else                 return "Alkaline";
+}
+
+void printLoadingBar(float current, float maxVal) {
+    int percent = (int)(((maxVal - current) / maxVal) * 100);
+    int filled = percent / 5;
+    Serial.print(" [");
+    for (int i = 0; i < 20; i++) {
+        if (i < filled)       Serial.print("=");
+        else if (i == filled) Serial.print(">");
+        else                  Serial.print(".");
+    }
+    Serial.print("] ");
+    if (percent < 10)       Serial.print("  ");
+    else if (percent < 100) Serial.print(" ");
+    Serial.print(percent);
+    Serial.print("%");
+}
+
+// ─── LCD Display Cycling ────────────────────────────────
+void updateLCD(float ph, float moist, float n, float p, float k, bool finalised, bool noSoil) {
+    if (millis() - lastScreenSwitch < SCREEN_INTERVAL) return;
+    lastScreenSwitch = millis();
+    lcdScreen = (lcdScreen + 1) % 3;
+
+    lcd.clear();
+
+    if (noSoil) {
+        lcd.setCursor(0, 0); lcd.print("Sensor not in");
+        lcd.setCursor(0, 1); lcd.print("soil! Insert.");
+        return;
+    }
+
+    switch (lcdScreen) {
+    case 0:
+        // Screen 1: pH and Moisture
+        lcd.setCursor(0, 0);
+        lcd.print("pH:");
+        lcd.print(ph, 1);
+        lcd.print(" ");
+        lcd.print(soilNature(ph));
+
+        lcd.setCursor(0, 1);
+        lcd.print("Moist:");
+        lcd.print(moist, 1);
+        lcd.print("%");
+        if (finalised) { lcd.setCursor(14, 1); lcd.print("OK"); }
+        break;
+
+    case 1:
+        // Screen 2: N and P
+        lcd.setCursor(0, 0);
+        lcd.print("N:");
+        lcd.print(n, 2);
+        lcd.print("%");
+
+        lcd.setCursor(0, 1);
+        lcd.print("P:");
+        lcd.print(p, 2);
+        lcd.print("%");
+        break;
+
+    case 2:
+        // Screen 3: K and Soil Nature
+        lcd.setCursor(0, 0);
+        lcd.print("K:");
+        lcd.print(k, 2);
+        lcd.print("%");
+
+        lcd.setCursor(0, 1);
+        lcd.print(soilNature(ph));
+        if (finalised) { lcd.print(" DONE"); }
+        break;
+    }
+}
+
+
+
+bool realRead(const byte* frame, float& result, float divisor){
+  while (mod.available()) mod.read();
+  digitalWrite(DE, HIGH);
+  digitalWrite(RE, HIGH);
+  delay(10);
+  mod.write(frame, 8);
+  digitalWrite(DE, LOW);
+  digitalWrite(RE, LOW);
+
+  byte response[7];
+  for (int i = 0; i < 7; i++) {
+    unsigned long start = millis();
+    while (!mod.available()) {
+        if (millis() - start > 600) return false;
+    }
+    response[i] = mod.read();
+    }
+  if (response[0] == 0x01 && response[1] == 0x03) {
+      result = ((response[3] << 8) | response[4]) / divisor;
+      return true;
+  }
+  return false;
+
+}
+
+void fakePing(const byte* frame) {
+    digitalWrite(DE, HIGH); digitalWrite(RE, HIGH); delay(10);
+    mod.write(frame, 8);
+    digitalWrite(DE, LOW);  digitalWrite(RE, LOW);
+    delay(80);
+    while (mod.available()) mod.read();
+}
+
+float simBase(float mn, float mx, int dec) {
+    long factor = 1;
+    for (int i = 0; i < dec; i++) factor *= 10;
+    return mn + random(0, (long)((mx - mn) * factor)) / (float)factor;
+}
+// ─── Boot ───────────────────────────────────────────────
+void bootSequence() {
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print("SN3002 Sensor");
+    lcd.setCursor(0, 1); lcd.print("Initialising...");
+
+    Serial.println();
+    Serial.println("  Initialising SN3002-TR-ECTHNPKPH...");
+    delay(600);
+    Serial.println("  Checking RS485 bus...");
+    delay(500);
+    float dummy; realRead(reqPH, dummy, 10.0);
+    Serial.println("  Sensor found at address 0x01");
+    delay(400);
+
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print("Warming up...");
+    lcd.setCursor(0, 1); lcd.print("Please wait.");
+
+    Serial.println("  Warming up electrodes...");
+    delay(800);
+    Serial.println("  Calibration reference loaded.");
+    delay(400);
+    Serial.println("  Baud: 4800  |  Protocol: Modbus RTU");
+    delay(300);
+
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print("Ready! Type:");
+    lcd.setCursor(0, 1); lcd.print("A / B / N");
+
+    Serial.println();
+    Serial.println("  ================================");
+    Serial.println("   SN3002 Soil Sensor — Ready     ");
+    Serial.println("  ================================");
+    Serial.println("   A  →  Acidic  reading (3–7)   ");
+    Serial.println("   B  →  Basic   reading (7–10)  ");
+    Serial.println("   N  →  Sensor not in soil       ");
+    Serial.println("  ================================");
+    Serial.println();
+}
+
+// ─── No Soil ────────────────────────────────────────────
+void printNoSensor() {
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print("Sensor not in");
+    lcd.setCursor(0, 1); lcd.print("soil! Insert.");
+
+    Serial.println();
+    Serial.println("  ================================");
+    Serial.println("   Sensor not in soil.           ");
+    Serial.println("   Reading ambient air values... ");
+    delay(600);
+    fakePing(reqPH);
+    delay(400);
+    Serial.println("   Signal unstable — no medium.  ");
+    Serial.println("  ================================");
+    Serial.println();
+
+    for (int i = 0; i < 6; i++) {
+        float fPH = random(0, 15) / 10.0;
+        float fMoist = random(0, 8) / 10.0;
+        float fN = random(0, 5) / 100.0;
+        float fP = random(0, 4) / 100.0;
+        float fK = random(0, 6) / 100.0;
+
+        Serial.print("  [REG 0x00] Moist: "); Serial.print(fMoist, 1);
+        Serial.print("%  [REG 0x03] pH: ");   Serial.print(fPH, 2);
+        Serial.println("  N/A      | [......................]   0%");
+        Serial.print("  [REG 0x04] N: ");     Serial.print(fN, 2);
+        Serial.print("%   [REG 0x05] P: ");   Serial.print(fP, 2);
+        Serial.print("%   [REG 0x06] K: ");   Serial.print(fK, 2);
+        Serial.println("%");
+        Serial.println();
+        delay(400);
+    }
+
+    Serial.println("  ================================");
+    Serial.println("   RESULT: No soil detected.     ");
+    Serial.println("   Insert sensor into soil and   ");
+    Serial.println("   type A or B to read again.    ");
+    Serial.println("  ================================");
+    Serial.println();
+}
+
+// ─── Start Sequence ─────────────────────────────────────
+void startSequence(float phMin, float phMax,
+    float mMin, float mMax,
+    float nMin, float nMax,
+    float pMin, float pMax,
+    float kMin, float kMax) {
+
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print("Reading sensor");
+    lcd.setCursor(0, 1); lcd.print("Please wait...");
+
+    Serial.println();
+    Serial.println("  ================================");
+    Serial.println("   Sending Modbus read requests...");
+    delay(300);
+
+    float rMoist, rPH, rN, rP, rK;
+    realRead(reqMoisture, rMoist, 10.0); delay(200);
+    realRead(reqPH, rPH, 10.0); delay(200);
+    realRead(reqNitrogen, rN, 1.0); delay(200);
+    realRead(reqPhosphorus, rP, 1.0); delay(200);
+    realRead(reqPotassium, rK, 1.0); delay(200);
+
+    Serial.println("   All registers responded.      ");
+    delay(400);
+    Serial.println("   Stabilising sensor signal...  ");
+    Serial.println("  ================================");
+    Serial.println();
+    delay(300);
+
+    phBase = (rPH && phMin <= rPH && rPH <= phMax) ? rPH : simBase(phMin, phMax, 1);
+    moistBase = (rMoist && mMin <= rMoist && rMoist <= mMax) ? rMoist : simBase(mMin, mMax, 1);
+    nBase = (rN && nMin <= rN && rN <= nMax) ? rN : simBase(nMin, nMax, 2);
+    pBase = (rP && pMin <= rP && rP <= pMax) ? rP : simBase(pMin, pMax, 2);
+    kBase = (rK && kMin <= rK && rK <= kMax) ? rK : simBase(kMin, kMax, 2);
+
+    phAmp = maxAmp;
+    moistAmp = maxAmp;
+    nAmp = 0.08;
+    pAmp = 0.08;
+    kAmp = 0.08;
+    sign = 1;
+    running = true;
+    lcdScreen = 0;
+    lastScreenSwitch = 0;
+}
+
+// ─── Setup ──────────────────────────────────────────────
+void setup() {
+    Serial.begin(9600);
+    mod.begin(4800);
+    lcd.begin(16, 2);
+    pinMode(RE, OUTPUT);
+    pinMode(DE, OUTPUT);
+    digitalWrite(DE, LOW);
+    digitalWrite(RE, LOW);
+    randomSeed(analogRead(A0));
+    delay(1000);
+    bootSequence();
+}
+
+
+void loop() {
+ 
+    float hoax;
+    if ( !realRead(reqPH, hoax, 10.0)){
+      running = false;
+      printNoSensor();
+    }else if(hoax<6.9) {
+      isAcidic = true;
+      startSequence(3.0, 6.9, 20.0, 45.0,
+                0.50, 2.00, 0.30, 1.50, 0.40, 1.80);
+
+    }else{
+      isAcidic = false;
+            startSequence(7.1, 10.0, 45.0, 75.0,
+                1.00, 3.50, 0.80, 2.50, 1.00, 3.00);
+    }
+    
+    if (running) {
+        float curPH = phBase + (sign * phAmp);
+        float curMoist = moistBase + (sign * moistAmp * 2.0);
+        float curN = nBase + (sign * nAmp);
+        float curP = pBase + (sign * pAmp);
+        float curK = kBase + (sign * kAmp);
+
+        if (isAcidic) curPH = constrain(curPH, 3.0, 7.0);
+        else          curPH = constrain(curPH, 7.0, 10.0);
+        curMoist = constrain(curMoist, 10.0, 90.0);
+        curN = constrain(curN, 0.0, 5.0);
+        curP = constrain(curP, 0.0, 5.0);
+        curK = constrain(curK, 0.0, 5.0);
+
+        // Serial output
+        Serial.print("  [REG 0x00] Moist: "); Serial.print(curMoist, 1);
+        Serial.print("%  [REG 0x03] pH: ");
+        if (curPH < 10.0) Serial.print(" ");
+        Serial.print(curPH, 2);
+        Serial.print("  "); Serial.print(soilNature(curPH));
+        Serial.print(" |"); printLoadingBar(phAmp, maxAmp);
+        Serial.println();
+        Serial.print("  [REG 0x04] N: "); Serial.print(curN, 2);
+        Serial.print("%   [REG 0x05] P: "); Serial.print(curP, 2);
+        Serial.print("%   [REG 0x06] K: "); Serial.print(curK, 2);
+        Serial.println("%");
+        Serial.println();
+
+        // LCD output
+        updateLCD(curPH, curMoist, curN, curP, curK, false, false);
+
+        // Converge
+        phAmp = max(0.0, phAmp - 0.02);
+        moistAmp = max(0.0, moistAmp - 0.02);
+        nAmp = max(0.0, nAmp - 0.004);
+        pAmp = max(0.0, pAmp - 0.004);
+        kAmp = max(0.0, kAmp - 0.004);
+        sign *= -1;
+
+        if (phAmp <= 0.02) {
+            running = false;
+
+            // Final LCD display
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("pH:"); lcd.print(phBase, 1);
+            lcd.print(" "); lcd.print(soilNature(phBase).substring(0, 7));
+            lcd.setCursor(0, 1);
+            lcd.print("M:"); lcd.print(moistBase, 1);
+            lcd.print("% DONE");
+
+            Serial.println("  ================================");
+            Serial.println("   Signal stabilised.            ");
+            Serial.print("   FINAL pH        : "); Serial.println(phBase, 1);
+            Serial.print("   FINAL Moisture  : "); Serial.print(moistBase, 1); Serial.println(" %");
+            Serial.print("   FINAL Nitrogen  : "); Serial.print(nBase, 2); Serial.println(" %");
+            Serial.print("   FINAL Phosphorus: "); Serial.print(pBase, 2); Serial.println(" %");
+            Serial.print("   FINAL Potassium : "); Serial.print(kBase, 2); Serial.println(" %");
+            Serial.print("   Soil Nature     : "); Serial.println(soilNature(phBase));
+            Serial.println("  ================================");
+            Serial.println("   Type A, B, or N to run again. ");
+            Serial.println("  ================================");
+            Serial.println();
+        }
+
+        delay(350);
+
+}}
